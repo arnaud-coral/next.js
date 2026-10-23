@@ -3,6 +3,7 @@ import { randomBytes } from 'crypto'
 import { isNextDeploy, isNextDev, nextTestSetup } from 'e2e-utils'
 import type { NextInstance } from 'e2e-utils'
 import cheerio from 'cheerio'
+import { retry } from 'next-test-utils'
 import {
   isOneTimeSpan,
   printSpanTree,
@@ -32,6 +33,8 @@ const MATCHER = [
   '/direct',
   '/user-overrides',
   '/user-traceparent',
+  '/outgoing',
+  '/root-state',
 ]
 
 // The middleware entry file is generated per variant: `config` must be a
@@ -142,8 +145,9 @@ async function getSpanTree(
 }
 
 function expectNoInternalHeaders(res: Response) {
-  for (const key of res.headers.keys()) {
+  for (const [key, value] of res.headers) {
     expect(key).not.toMatch(/^x-middleware-(request-|override-headers)/)
+    expect(value).not.toContain('next-deferred')
   }
 }
 
@@ -1006,6 +1010,44 @@ describe.each(VARIANTS)(
         }
       }
     )
+
+    // The `next-deferred` tracestate entry deferring the middleware's request
+    // span to the render (when deployed) is only for the render: neither the
+    // middleware's nor the render's outgoing requests carry it, nor do the
+    // request headers the render sees.
+    it('does not forward the deferred request span beyond the render', async () => {
+      const res = await next.fetch('/outgoing')
+      expect(res.status).toBe(200)
+      expectNoInternalHeaders(res)
+      const $ = cheerio.load(await res.text())
+      const tracestates = {
+        middlewareOutgoing: res.headers.get('x-mw-outgoing-tracestate'),
+        renderOutgoing: $('#outgoing-tracestate').text(),
+        renderRequest: $('#request-tracestate').text(),
+      }
+      for (const tracestate of Object.values(tracestates)) {
+        // JSON: `null` or the header value.
+        expect(tracestate).toBeTruthy()
+        expect(tracestate).not.toContain('next-deferred')
+      }
+    })
+
+    // The middleware doesn't leave its request's root span open in the SDK
+    // (which keeps open root spans, e.g. `@vercel/otel`): when deployed, the
+    // request span the render emits is reserved, not started, in the
+    // middleware.
+    it('does not leave root spans open in the middleware', async () => {
+      for (const path of ['/page', '/rewrite', '/route-handler', '/direct']) {
+        const res = await next.fetch(path)
+        expect(res.status).toBe(200)
+        await res.text()
+      }
+      await retry(async () => {
+        const res = await next.fetch('/root-state')
+        expect(res.status).toBe(200)
+        expect(await res.json()).toEqual({ open: [] })
+      })
+    })
   }
 )
 
